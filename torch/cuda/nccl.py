@@ -4,7 +4,7 @@ import warnings
 import torch.cuda
 from torch.backends.cudnn import int_array
 
-__all__ = ['all_reduce', 'reduce', 'broadcast', 'all_gather', 'reduce_scatter']
+__all__ = ['all_reduce', 'all_reduce_sync', 'reduce', 'broadcast', 'all_gather', 'reduce_scatter']
 
 SUM = 0  # ncclRedOp_t
 
@@ -34,8 +34,14 @@ def all_reduce(inputs, outputs=None, op=SUM):
     torch._C._nccl_all_reduce(inputs, outputs, op)
 
 
+def all_reduce_sync(inputs, outputs=None, op=SUM):
+    if outputs is None:
+        outputs = inputs
+    torch._C._nccl_all_reduce_sync(inputs, outputs, op)
+
+
 def reduce(inputs, outputs=None, root=0, op=SUM, streams=None):
-    assert(root >= 0 and root < len(inputs))
+    assert (root >= 0 and root < len(inputs))
     if outputs is None:
         outputs = inputs
     if streams is None:
@@ -44,7 +50,7 @@ def reduce(inputs, outputs=None, root=0, op=SUM, streams=None):
 
 
 def broadcast(inputs, root=0):
-    assert(root >= 0 and root < len(inputs))
+    assert (root >= 0 and root < len(inputs))
     torch._C._nccl_broadcast(inputs, root)
 
 

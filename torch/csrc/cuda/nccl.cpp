@@ -8,6 +8,16 @@
 #include <sstream>
 #include <unordered_map>
 
+static inline void CUDACHECK(cudaError_t status)
+{
+  if (status != cudaSuccess) {
+    std::stringstream err;
+    err << "CUDA Error " << status << ": " << cudaGetErrorString(status);
+    throw std::runtime_error(err.str());
+  }
+}
+
+
 static inline void CHECK(ncclResult_t status)
 {
   if (status != ncclSuccess) {
@@ -219,6 +229,67 @@ PyObject * THCPModule_nccl_all_reduce(PyObject *self, PyObject *args) {
 #if defined(NCCL_MAJOR) && (NCCL_MAJOR >= 2)
   CHECK(ncclGroupEnd());
 #endif
+
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
+
+PyObject * THCPModule_nccl_all_reduce_sync(PyObject *self, PyObject *args) {
+  HANDLE_TH_ERRORS
+  PyObject *_inputs, *_outputs;
+  int op;
+
+  if (!PyArg_ParseTuple(args, "OOi", &_inputs, &_outputs, &op)) {
+    THPUtils_invalidArguments(args, NULL, "nccl_all_reduce_sync", 1,
+			      "(sequence[Tensor] inputs, sequence[Tensor]"
+			      " outputs, int op");
+    return NULL;
+  }
+
+  std::vector<at::Tensor> inputs = THPUtils_PySequence_to_TensorList(_inputs);
+  std::vector<at::Tensor> outputs = THPUtils_PySequence_to_TensorList(_outputs);
+
+  // we can safely release GIL after this line, no python API used
+  AutoNoGIL no_gil;
+  _check_inputs(inputs, outputs, 1, 1);
+  size_t len = inputs.size();
+
+  ncclDataType_t data_type = _get_data_type(inputs[0].type().ID());
+
+  int64_t count = inputs[0].numel();
+  std::lock_guard<std::mutex> lock(*(THCCachingAllocator_getCudaFreeMutex()));
+  ncclComm_t *comm = _get_communicator(inputs);
+  AutoGPU gpu_guard;
+
+  static cudaStream_t* s = NULL;
+  if (s == NULL)
+  {
+    s = (cudaStream_t*)malloc(sizeof(cudaStream_t)*len);
+    for (size_t i = 0; i < len; i++) {
+      int device = inputs[i].get_device();
+      gpu_guard.setDevice(device);
+      CUDACHECK(cudaStreamCreate(s+i));
+    }
+  }
+
+#if defined(NCCL_MAJOR) && (NCCL_MAJOR >= 2)
+  CHECK(ncclGroupStart());
+#endif
+  for (size_t i = 0; i < len; i++) {
+    int device = inputs[i].get_device();
+    gpu_guard.setDevice(device);
+    CHECK(ncclAllReduce(inputs[i].data_ptr(), outputs[i].data_ptr(),
+			count, data_type, (ncclRedOp_t) op, comm[i], s[i]));
+  }
+#if defined(NCCL_MAJOR) && (NCCL_MAJOR >= 2)
+  CHECK(ncclGroupEnd());
+#endif
+
+  for (size_t i = 0; i < len; i++) {
+    int device = inputs[i].get_device();
+    gpu_guard.setDevice(device);
+    CUDACHECK(cudaStreamSynchronize(s[i]));
+  }  
 
   Py_RETURN_NONE;
   END_HANDLE_TH_ERRORS

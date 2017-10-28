@@ -7,8 +7,7 @@ from .. import functional as F
 # TODO: check contiguous in THNN
 # TODO: use separate backend functions?
 class _BatchNorm(Module):
-
-    def __init__(self, num_features, eps=1e-5, momentum=0.1, affine=True):
+    def __init__(self, num_features, eps=1e-5, momentum=0.5, affine=True):
         super(_BatchNorm, self).__init__()
         self.num_features = num_features
         self.affine = affine
@@ -32,14 +31,10 @@ class _BatchNorm(Module):
             self.bias.data.zero_()
 
     def forward(self, input):
-        return F.batch_norm(
-            input, self.running_mean, self.running_var, self.weight, self.bias,
-            self.training, self.momentum, self.eps)
+        return F.batch_norm(input, self.running_mean, self.running_var, self.weight, self.bias, self.training, self.momentum, self.eps)
 
     def __repr__(self):
-        return ('{name}({num_features}, eps={eps}, momentum={momentum},'
-                ' affine={affine})'
-                .format(name=self.__class__.__name__, **self.__dict__))
+        return ('{name}({num_features}, eps={eps}, momentum={momentum},' ' affine={affine})'.format(name=self.__class__.__name__, **self.__dict__))
 
 
 class BatchNorm1d(_BatchNorm):
@@ -87,8 +82,7 @@ class BatchNorm1d(_BatchNorm):
 
     def _check_input_dim(self, input):
         if input.dim() != 2 and input.dim() != 3:
-            raise ValueError('expected 2D or 3D input (got {}D input)'
-                             .format(input.dim()))
+            raise ValueError('expected 2D or 3D input (got {}D input)'.format(input.dim()))
         super(BatchNorm1d, self)._check_input_dim(input)
 
 
@@ -137,8 +131,7 @@ class BatchNorm2d(_BatchNorm):
 
     def _check_input_dim(self, input):
         if input.dim() != 4:
-            raise ValueError('expected 4D input (got {}D input)'
-                             .format(input.dim()))
+            raise ValueError('expected 4D input (got {}D input)'.format(input.dim()))
         super(BatchNorm2d, self)._check_input_dim(input)
 
 
@@ -188,6 +181,5 @@ class BatchNorm3d(_BatchNorm):
 
     def _check_input_dim(self, input):
         if input.dim() != 5:
-            raise ValueError('expected 5D input (got {}D input)'
-                             .format(input.dim()))
+            raise ValueError('expected 5D input (got {}D input)'.format(input.dim()))
         super(BatchNorm3d, self)._check_input_dim(input)

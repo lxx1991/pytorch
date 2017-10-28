@@ -89,7 +89,7 @@ def data_parallel(module, inputs, device_ids=None, output_device=None, dim=0, mo
         output_device
     """
     if not isinstance(inputs, tuple):
-        inputs = (inputs,)
+        inputs = (inputs, )
 
     if device_ids is None:
         device_ids = list(range(torch.cuda.device_count()))

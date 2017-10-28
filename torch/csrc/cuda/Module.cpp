@@ -389,6 +389,7 @@ static struct PyMethodDef _THCPModule_methods[] = {
 #ifdef WITH_NCCL
   {"_nccl_reduce", (PyCFunction)THCPModule_nccl_reduce, METH_VARARGS, NULL},
   {"_nccl_all_reduce", (PyCFunction)THCPModule_nccl_all_reduce, METH_VARARGS, NULL},
+  {"_nccl_all_reduce_sync", (PyCFunction)THCPModule_nccl_all_reduce_sync, METH_VARARGS, NULL},
   {"_nccl_broadcast", (PyCFunction)THCPModule_nccl_broadcast, METH_VARARGS, NULL},
   {"_nccl_all_gather", (PyCFunction)THCPModule_nccl_all_gather, METH_VARARGS, NULL},
   {"_nccl_reduce_scatter", (PyCFunction)THCPModule_nccl_reduce_scatter, METH_VARARGS, NULL},

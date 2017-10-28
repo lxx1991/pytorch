@@ -1,6 +1,88 @@
 import torch
 from . import nccl
 from torch._utils import _accumulate, _take_tensors, _flatten_tensors, _unflatten_tensors
+import threading
+
+comm_has_Listener = False
+comm_device_num = 0
+comm_data_ready = []
+comm_data_list = []
+comm_result_list = []
+comm_result_ready = []
+
+
+def all_reduce(input, destination=None):
+
+    global comm_data_list
+    global comm_result_list
+    nccl.all_reduce_sync(comm_data_list, comm_result_list)
+    # x = comm_result_list[6][0][0]
+    # s = 0.0
+    # for i in range(comm_device_num):
+    #     s += comm_data_list[i][0][0]
+    # if (s - x) > 0.1:
+    #     print('sum:', s - x)
+
+
+def comm_init(device_num):
+    global comm_has_Listener
+    global comm_device_num
+    global comm_data_ready
+    global comm_data_list
+    global comm_result_list
+    global comm_result_ready
+
+    if comm_has_Listener:
+        return
+    else:
+        comm_has_Listener = True
+
+    comm_device_num = device_num
+    comm_data_list = [None] * device_num
+    comm_result_list = [None] * device_num
+    comm_data_ready = [threading.Event() for _ in range(device_num)]
+    comm_result_ready = [threading.Event() for _ in range(device_num)]
+
+    for i in range(comm_device_num):
+        comm_data_ready[i].clear()
+        comm_result_ready[i].set()
+
+    def _worker():
+        while (True):
+            for i in range(comm_device_num):
+                comm_data_ready[i].wait()
+
+            comm_result_list = all_reduce(comm_data_list)
+            for i in range(comm_device_num):
+                comm_data_ready[i].clear()
+                comm_result_ready[i].set()
+
+    thread = threading.Thread(target=_worker)
+    thread.daemon = True
+    thread.start()
+
+
+def all_reduce_thread(input):
+
+    global comm_has_Listener
+    global comm_device_num
+    global comm_data_ready
+    global comm_data_list
+    global comm_result_list
+    global comm_result_ready
+
+    if not comm_has_Listener:
+        return input
+
+    input_device = input.get_device()
+    comm_data_list[input_device] = input
+    with torch.cuda.device(input_device):
+        comm_result_list[input_device] = type(input)(input.size()).zero_()
+    comm_result_ready[input_device].clear()
+    comm_data_ready[input_device].set()
+    comm_result_ready[input_device].wait()
+
+    return comm_result_list[input_device]
 
 
 def broadcast(tensor, devices):
@@ -85,8 +167,7 @@ def reduce_add(inputs, destination=None):
         if inp.size() != input_size:
             got = 'x'.join(str(x) for x in inp.size())
             expected = 'x'.join(str(x) for x in input_size)
-            raise ValueError("input {} has invalid size: got {}, but expected "
-                             "{}".format(i, got, expected))
+            raise ValueError("input {} has invalid size: got {}, but expected " "{}".format(i, got, expected))
     assert nccl_root is not None, "reduce_add expects destination to be on the same GPU with one of the tensors"
     with torch.cuda.device(destination):
         result = type(inp)(input_size).zero_()
@@ -152,8 +233,7 @@ def scatter(tensor, devices, chunk_sizes=None, dim=0, streams=None):
             "don't sum up to the tensor's size (sum(chunk_sizes) == {}, but " \
             "expected {})".format(sum(chunk_sizes), tensor.size(dim))
         assert min(chunk_sizes) > 0, "got a negative chunk_size"
-        chunks = [tensor.narrow(dim, start - size, size)
-                  for start, size in zip(_accumulate(chunk_sizes), chunk_sizes)]
+        chunks = [tensor.narrow(dim, start - size, size) for start, size in zip(_accumulate(chunk_sizes), chunk_sizes)]
     chunks = tuple(chunk.contiguous() for chunk in chunks)
     # TODO: copy to a pinned buffer first (if copying from CPU)
     if streams is None:
@@ -188,8 +268,7 @@ def gather(tensors, dim=0, destination=None):
         if list(tensor.size()) != expected_size:
             got = 'x'.join(str(x) for x in tensor.size())
             expected = 'x'.join(str(x) for x in expected_size)
-            raise ValueError("gather got an input of invalid size: got {}, "
-                             "but expected {}".format(got, expected))
+            raise ValueError("gather got an input of invalid size: got {}, " "but expected {}".format(got, expected))
         total_size += tensor.size(dim)
     expected_size[dim] = total_size
     expected_size = torch.Size(expected_size)
