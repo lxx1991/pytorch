@@ -410,12 +410,16 @@ class Module(object):
                                        'whose dimensions in the checkpoint are {}.'
                                        .format(name, own_state[name].size(), param.size()))
             elif strict:
-                raise KeyError('unexpected key "{}" in state_dict'
-                               .format(name))
-        if strict:
-            missing = set(own_state.keys()) - set(state_dict.keys())
-            if len(missing) > 0:
+                raise KeyError('unexpected key "{}" in state_dict'.format(name))
+            else:
+                print('unexpected key "{}" in state_dict'.format(name))
+
+        missing = set(own_state.keys()) - set(state_dict.keys())
+        if len(missing) > 0:
+            if strict:
                 raise KeyError('missing keys in state_dict: "{}"'.format(missing))
+            else:
+                print('missing keys in state_dict: "{}"'.format(missing))
 
     def parameters(self):
         """Returns an iterator over module parameters.
