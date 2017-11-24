@@ -238,6 +238,7 @@ view of a storage and defines numeric operations on it.
    .. automethod:: pow_
    .. automethod:: prod
    .. automethod:: pstrf
+   .. automethod:: put_
    .. automethod:: qr
    .. automethod:: random_
    .. automethod:: reciprocal
@@ -285,6 +286,7 @@ view of a storage and defines numeric operations on it.
    .. automethod:: symeig
    .. automethod:: t
    .. automethod:: t_
+   .. automethod:: take
    .. automethod:: tan
    .. automethod:: tan_
    .. automethod:: tanh
@@ -311,3 +313,10 @@ view of a storage and defines numeric operations on it.
    .. automethod:: view
    .. automethod:: view_as
    .. automethod:: zero_
+
+.. class:: ByteTensor()
+
+   The following methods are unique to :class:`torch.ByteTensor`.
+
+   .. automethod:: all
+   .. automethod:: any

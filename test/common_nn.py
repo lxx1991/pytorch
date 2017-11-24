@@ -27,6 +27,13 @@ PRECISION = 1e-5
 def get_size_average(m):
     return getattr(m, 'size_average', False) or getattr(m, 'sizeAverage', False)
 
+
+def get_weight(m):
+    result = getattr(m, 'weight', None)
+    if result is not None:
+        return result
+    return getattr(m, 'weights', None)
+
 module_tests = [
     dict(
         module_name='Linear',
@@ -239,6 +246,87 @@ module_tests = [
 ]
 
 
+def kldivloss_reference(input, target, size_average=True, reduce=True):
+    safe_target = target * (target > 0).type_as(target)
+    safe_target_log = (safe_target + (target <= 0).type_as(target)).log()
+    result = safe_target * (safe_target_log - input)
+    if reduce and size_average:
+        return result.mean()
+    elif reduce:
+        return result.sum()
+    return result
+
+
+def nllloss2d_reference(input, target, weight=None, ignore_index=-100,
+                        size_average=True, reduce=True):
+    N, C, H, W = input.size()
+    output = torch.zeros(N, H, W).type_as(input)
+    if isinstance(target, Variable):
+        target = target.data
+
+    if weight is None:
+        weight = torch.ones(C).type_as(input)
+
+    total_weight_data = 0
+    for n in range(0, N):
+        for h in range(0, H):
+            for w in range(0, W):
+                t_nhw = target[n][h][w]
+                norm = 0. if ignore_index == t_nhw else weight[t_nhw]
+                output[n][h][w] = -input[n][t_nhw][h][w] * norm
+                total_weight_data += norm
+
+    if reduce and size_average:
+        return output.sum() / total_weight_data
+    elif reduce:
+        return output.sum()
+    return output
+
+
+def nllloss_reference(input, target, weight=None, ignore_index=-100,
+                      size_average=True, reduce=True):
+    if isinstance(target, Variable):
+        target = target.data
+
+    def nll_loss_helper(input, target, weight, ignore_index):
+        if target is ignore_index:
+            return (0, 0)
+        norm = 1 if weight is None else weight[target]
+        result = -input[target] * norm
+        return (result, norm)
+
+    losses_and_weights = [nll_loss_helper(i, t, weight, ignore_index)
+                          for i, t in zip(input, target)]
+    losses, weights = zip(*losses_and_weights)
+    losses_tensor = torch.Tensor(losses).type_as(input)
+    if reduce and size_average:
+        return sum(losses_tensor) / sum(weights)
+    elif reduce:
+        return sum(losses_tensor)
+    else:
+        return losses_tensor
+
+
+def smoothl1loss_reference(input, target, size_average=True, reduce=True):
+    abs_diff = (input - target).abs()
+    ge_one_mask = (abs_diff >= 1).type_as(abs_diff)
+    lt_one_mask = (abs_diff < 1).type_as(abs_diff)
+    output = ge_one_mask * (abs_diff - 0.5) + lt_one_mask * 0.5 * (abs_diff ** 2)
+    if reduce and size_average:
+        return output.mean()
+    elif reduce:
+        return output.sum()
+    return output
+
+
+loss_reference_fns = {
+    'KLDivLoss': kldivloss_reference,
+    'NLLLoss': nllloss_reference,
+    'NLLLoss2d': nllloss2d_reference,
+    'SmoothL1Loss': smoothl1loss_reference,
+}
+
+
 criterion_tests = [
     dict(
         module_name='L1Loss',
@@ -251,13 +339,16 @@ criterion_tests = [
         module_name='NLLLoss',
         input_fn=lambda: torch.rand(15, 10).log(),
         target_fn=lambda: torch.Tensor(15).uniform_().mul(10).floor().long(),
-        check_no_size_average=True,
+        reference_fn=lambda i, t, m:
+            nllloss_reference(i, t, size_average=get_size_average(m)),
+        check_no_size_average=True
     ),
     dict(
         module_name='NLLLoss',
         constructor_args=(None, True, 2),
         input_fn=lambda: torch.rand(15, 10).log(),
         target_fn=lambda: torch.Tensor(15).uniform_().mul(10).floor().long(),
+        reference_fn=lambda i, t, _: nllloss_reference(i, t, ignore_index=2),
         desc='ignore_index'
     ),
     dict(
@@ -265,6 +356,8 @@ criterion_tests = [
         constructor_args_fn=lambda: (torch.rand(10),),
         input_fn=lambda: torch.rand(15, 10).add(1e-2).log(),
         target_fn=lambda: torch.Tensor(15).uniform_().mul(10).floor().long(),
+        reference_fn=lambda i, t, m:
+            nllloss_reference(i, t, weight=get_weight(m)),
         desc='weights',
     ),
     dict(
@@ -272,6 +365,8 @@ criterion_tests = [
         constructor_args_fn=lambda: (torch.rand(10), True, 2),
         input_fn=lambda: torch.rand(15, 10).add(1e-2).log(),
         target_fn=lambda: torch.Tensor(15).uniform_().mul(10).floor().long(),
+        reference_fn=lambda i, t, m:
+            nllloss_reference(i, t, weight=get_weight(m), ignore_index=2),
         desc='weights_ignore_index'
     ),
     dict(
@@ -279,12 +374,16 @@ criterion_tests = [
         constructor_args_fn=lambda: (torch.rand(10), True, -1),
         input_fn=lambda: torch.rand(15, 10).add(1e-2).log(),
         target_fn=lambda: torch.Tensor(15).uniform_().mul(10 + 1).floor().long() - 1,
+        reference_fn=lambda i, t, m:
+            nllloss_reference(i, t, weight=get_weight(m), ignore_index=-1),
         desc='weights_ignore_index_neg'
     ),
     dict(
         module_name='KLDivLoss',
         input_fn=lambda: torch.rand(10, 10).log(),
         target_fn=lambda: torch.rand(10, 10),
+        reference_fn=lambda i, t, m:
+            kldivloss_reference(i, t, get_size_average(m), reduce=True),
         check_no_size_average=True,
     ),
     dict(
@@ -324,6 +423,8 @@ criterion_tests = [
         module_name='NLLLoss2d',
         input_size=(2, 3, 5, 5),
         target_fn=lambda: torch.rand(2, 5, 5).mul(3).floor().long(),
+        reference_fn=lambda i, t, m:
+            nllloss2d_reference(i, t, size_average=get_size_average(m)),
         check_no_size_average=True,
     ),
     dict(
@@ -331,13 +432,17 @@ criterion_tests = [
         constructor_args_fn=lambda: (torch.rand(3),),
         input_size=(2, 3, 5, 5),
         target=torch.rand(2, 5, 5).mul(3).floor().long(),
+        reference_fn=lambda i, t, m:
+            nllloss2d_reference(i, t, weight=get_weight(m)),
         desc='weights',
     ),
     dict(
         module_name='NLLLoss2d',
-        constructor_args=(None, True, 3),
+        constructor_args=(None, True, 1),
         input_size=(2, 3, 5, 5),
-        target_fn=lambda: torch.rand(2, 5, 5).mul(4).floor().long(),
+        target_fn=lambda: torch.rand(2, 5, 5).mul(3).floor().long(),
+        reference_fn=lambda i, t, m:
+            nllloss2d_reference(i, t, ignore_index=1),
         desc='ignore_index',
     ),
     dict(
@@ -385,6 +490,8 @@ criterion_tests = [
         input_size=(5, 10),
         target_size=(5, 10),
         check_no_size_average=True,
+        reference_fn=lambda i, t, m:
+            smoothl1loss_reference(i, t, size_average=get_size_average(m)),
     ),
     dict(
         module_name='SoftMarginLoss',

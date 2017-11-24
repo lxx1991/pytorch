@@ -15,16 +15,18 @@ class MaxPool1d(Function):
     @staticmethod
     def symbolic(g, input, kernel_size, stride=None, padding=0, dilation=1,
                  ceil_mode=False):
+        from torch.onnx.symbolic import _unimplemented
         if ceil_mode:
-            raise RuntimeError("ceil_mode not supported in MaxPool1d")
+            return _unimplemented("MaxPool1d", "ceil_mode")
+        if set(_single(dilation)) != {1}:
+            return _unimplemented("MaxPool1d", "dilation")
         if stride is None:
             stride = kernel_size
-        n = g.appendNode(g.create("MaxPool", [input])
-                          .is_("kernel_shape", _single(kernel_size))
-                          .is_("pads", _single(padding))
-                          .is_("dilations", _single(dilation))
-                          .is_("strides", _single(stride)))
-        return (n, None)
+        r = g.op("MaxPool", input,
+                 kernel_shape_i=_single(kernel_size),
+                 pads_i=_single(padding),
+                 strides_i=_single(stride))
+        return r, None
 
     @staticmethod
     def forward(ctx, input, kernel_size, stride=None, padding=0, dilation=1,
@@ -101,16 +103,18 @@ class MaxPool3d(Function):
     @staticmethod
     def symbolic(g, input, kernel_size, stride=None, padding=0, dilation=1,
                  ceil_mode=False):
+        from torch.onnx.symbolic import _unimplemented
         if ceil_mode:
-            raise RuntimeError("ceil_mode not supported in MaxPool3d")
+            return _unimplemented("MaxPool3d", "ceil_mode")
+        if set(_triple(dilation)) != {1}:
+            return _unimplemented("MaxPool3d", "dilation")
         if stride is None:
             stride = kernel_size
-        n = g.appendNode(g.create("MaxPool", [input])
-                          .is_("kernel_shape", _triple(kernel_size))
-                          .is_("pads", _triple(padding))
-                          .is_("dilations", _triple(dilation))
-                          .is_("strides", _triple(stride)))
-        return (n, None)
+        r = g.op("MaxPool", input,
+                 kernel_shape_i=_triple(kernel_size),
+                 pads_i=_triple(padding),
+                 strides_i=_triple(stride))
+        return r, None
 
     @staticmethod
     def forward(ctx, input, kernel_size, stride=None, padding=0, dilation=1,
@@ -455,7 +459,10 @@ class AdaptiveMaxPool2d(Function):
 
     @staticmethod
     def forward(ctx, input, output_size):
-        ctx.output_size = _pair(output_size)
+        ctx.output_size = list(_pair(output_size))
+        for i, s in enumerate(ctx.output_size):
+            ctx.output_size[i] = ctx.output_size[i] or input.size(i + 2)
+        ctx.output_size = tuple(ctx.output_size)
         backend = type2backend[type(input)]
         indices, output = input.new().long(), input.new()
         backend.SpatialAdaptiveMaxPooling_updateOutput(backend.library_state,
@@ -499,7 +506,10 @@ class AdaptiveMaxPool3d(Function):
 
     @staticmethod
     def forward(ctx, input, output_size):
-        ctx.output_size = _triple(output_size)
+        ctx.output_size = list(_triple(output_size))
+        for i, s in enumerate(ctx.output_size):
+            ctx.output_size[i] = ctx.output_size[i] or input.size(i + 2)
+        ctx.output_size = tuple(ctx.output_size)
         backend = type2backend[type(input)]
         indices, output = input.new().long(), input.new()
         backend.VolumetricAdaptiveMaxPooling_updateOutput(
@@ -593,7 +603,11 @@ class AdaptiveAvgPool2d(Function):
 
     @staticmethod
     def forward(ctx, input, output_size):
-        ctx.output_size = _pair(output_size)
+        ctx.output_size = list(_pair(output_size))
+        for i, s in enumerate(ctx.output_size):
+            ctx.output_size[i] = ctx.output_size[i] or input.size(i + 2)
+        ctx.output_size = tuple(ctx.output_size)
+
         backend = type2backend[type(input)]
         output = input.new()
         ctx.save_for_backward(input)
@@ -632,7 +646,11 @@ class AdaptiveAvgPool3d(Function):
 
     @staticmethod
     def forward(ctx, input, output_size):
-        ctx.output_size = _triple(output_size)
+        ctx.output_size = list(_triple(output_size))
+        for i, s in enumerate(ctx.output_size):
+            ctx.output_size[i] = ctx.output_size[i] or input.size(i + 2)
+        ctx.output_size = tuple(ctx.output_size)
+
         backend = type2backend[type(input)]
         output = input.new()
         ctx.save_for_backward(input)

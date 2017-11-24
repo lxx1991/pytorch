@@ -1,6 +1,9 @@
 #include <Python.h>
 #include <sys/types.h>
+
+#ifndef _MSC_VER
 #include <sys/socket.h>
+#endif
 
 #include <stdbool.h>
 #include <unordered_map>
@@ -54,14 +57,14 @@ static bool THPModule_loadClasses(PyObject *self)
   if (!THPCharTensor_postInit(torch_module)) return false;
   if (!THPByteTensor_postInit(torch_module)) return false;
 
-  ASSERT_NOT_NULL(THPDoubleStorageClass = PyObject_GetAttrString(torch_module,(char*)"DoubleStorage"));
-  ASSERT_NOT_NULL(THPFloatStorageClass  = PyObject_GetAttrString(torch_module,(char*)"FloatStorage"));
-  ASSERT_NOT_NULL(THPHalfStorageClass   = PyObject_GetAttrString(torch_module,(char*)"HalfStorage"));
-  ASSERT_NOT_NULL(THPLongStorageClass   = PyObject_GetAttrString(torch_module,(char*)"LongStorage"));
-  ASSERT_NOT_NULL(THPIntStorageClass    = PyObject_GetAttrString(torch_module,(char*)"IntStorage"));
-  ASSERT_NOT_NULL(THPShortStorageClass  = PyObject_GetAttrString(torch_module,(char*)"ShortStorage"));
-  ASSERT_NOT_NULL(THPCharStorageClass   = PyObject_GetAttrString(torch_module,(char*)"CharStorage"));
-  ASSERT_NOT_NULL(THPByteStorageClass   = PyObject_GetAttrString(torch_module,(char*)"ByteStorage"));
+  THPDoubleStorage_postInit(torch_module);
+  THPFloatStorage_postInit(torch_module);
+  THPHalfStorage_postInit(torch_module);
+  THPLongStorage_postInit(torch_module);
+  THPIntStorage_postInit(torch_module);
+  THPShortStorage_postInit(torch_module);
+  THPCharStorage_postInit(torch_module);
+  THPByteStorage_postInit(torch_module);
 
   return true;
 #undef ASSERT_NOT_NULL
@@ -172,6 +175,8 @@ PyObject * THPModule_fromNumpy(PyObject *_unused, PyObject *array)
     return PyObject_CallFunctionObjArgs(THPDoubleTensorClass, array, NULL);
   } else if (type == NPY_FLOAT) {
     return PyObject_CallFunctionObjArgs(THPFloatTensorClass, array, NULL);
+  } else if (type == NPY_HALF) {
+    return PyObject_CallFunctionObjArgs(THPHalfTensorClass, array, NULL);
   } else if (type == NPY_INT64) {
     return PyObject_CallFunctionObjArgs(THPLongTensorClass, array, NULL);
   } else if (type == NPY_INT32) {
@@ -182,7 +187,7 @@ PyObject * THPModule_fromNumpy(PyObject *_unused, PyObject *array)
     return PyObject_CallFunctionObjArgs(THPByteTensorClass, array, NULL);
   }
   THPUtils_setError("can't convert a given np.ndarray to a tensor - it has an "
-      "invalid type. The only supported types are: double, float, int64, "
+      "invalid type. The only supported types are: double, float, float16, int64, "
       "int32, and uint8.");
   return NULL;
 #endif
@@ -192,30 +197,66 @@ PyObject * THPModule_fromNumpy(PyObject *_unused, PyObject *array)
  * STATELESS FUNCTIONS
  **/
 
+static PyObject * findTensor(PyObject *args, PyObject *kwargs) {
+  for (Py_ssize_t i = 0; i < PyTuple_Size(args); i++) {
+    PyObject *item = PyTuple_GET_ITEM(args, i);
+    if (THPModule_isTensor(item) || THPVariable_Check(item)) {
+      return item;
+    }
+  }
+  if (kwargs) {
+    Py_ssize_t pos = 0;
+    PyObject *key, *value;
+    while (PyDict_Next(kwargs, &pos, &key, &value)) {
+      if (THPModule_isTensor(value) || THPVariable_Check(value)) {
+        return value;
+      }
+    }
+  }
+  return THPDefaultTensorClass;
+}
+
+static PyObject * swapFirstTwoItems(PyObject *args) {
+  // Returns a tuple with the first two items swapped
+  auto size = PyTuple_GET_SIZE(args);
+  auto r = THPObjectPtr{PyTuple_New(size)};
+  if (!r) return nullptr;
+  for (Py_ssize_t i = 0; i < size; i++) {
+    PyObject* obj = PyTuple_GET_ITEM(args, (i <= 1 ? 1 - i : i));
+    Py_INCREF(obj);
+    PyTuple_SET_ITEM(r.get(), i, obj);
+  }
+  return r.release();
+}
+
+static PyObject * dispatchStateless(PyObject *args, PyObject *kwargs, const char *name) {
+  PyObject *tensor = findTensor(args, kwargs);
+  return THPUtils_dispatchStateless(tensor, name, args, kwargs);
+}
+
+static PyObject * dispatchStatelessAddXX(PyObject *args, PyObject *kwargs, const char *name) {
+  PyObject *tensor = findTensor(args, kwargs);
+  if (THPVariable_Check(tensor) && PyTuple_GET_SIZE(args) >= 2 && tensor == PyTuple_GET_ITEM(args, 1)) {
+    // On Variables, swap the first two arguments if the 'self' argument comes
+    // second. This handles the deprecated torch.addxx signatures. For example,
+    // torch.addmm(1, var, 2, a, b) -> var.addmm(1, 2, a, b)
+    auto newArgs = THPObjectPtr{swapFirstTwoItems(args)};
+    return THPUtils_dispatchStateless(tensor, name, newArgs.get(), kwargs);
+  } else {
+    return THPUtils_dispatchStateless(tensor, name, args, kwargs);
+  }
+}
+
 #define IMPLEMENT_STATELESS(name)                                              \
 static PyObject * TH_CONCAT_2(THPModule_, name)(PyObject *_unused, PyObject *args, PyObject *kwargs) \
 {                                                                              \
-  PyObject *tensor = THPDefaultTensorClass;                                    \
-  PyObject *key, *value;                                                       \
-  Py_ssize_t pos = 0;                                                          \
-  for (int i = 0; i < PyTuple_Size(args); i++) {                               \
-    PyObject *item = PyTuple_GET_ITEM(args, i);                                \
-    if (THPModule_isTensor(item) || THPVariable_Check(item)) {                 \
-      tensor = item;                                                           \
-      goto dispatch;                                                           \
-    }                                                                          \
-  }                                                                            \
-  if (kwargs) {                                                                \
-    while (PyDict_Next(kwargs, &pos, &key, &value)) {                          \
-      if (THPModule_isTensor(value) || THPVariable_Check(value)) {             \
-        tensor = value;                                                        \
-        goto dispatch;                                                         \
-      }                                                                        \
-    }                                                                          \
-  }                                                                            \
-                                                                               \
-dispatch:                                                                      \
-  return THPUtils_dispatchStateless(tensor, #name, args, kwargs);              \
+  return dispatchStateless(args, kwargs, #name);                               \
+}
+
+#define IMPLEMENT_STATELESS_ADDXX(name)                                        \
+static PyObject * TH_CONCAT_2(THPModule_, name)(PyObject *_unused, PyObject *args, PyObject *kwargs) \
+{                                                                              \
+  return dispatchStatelessAddXX(args, kwargs, #name);                          \
 }
 
 IMPLEMENT_STATELESS(sigmoid)
@@ -293,15 +334,9 @@ IMPLEMENT_STATELESS(zeros_like)
 IMPLEMENT_STATELESS(ones)
 IMPLEMENT_STATELESS(ones_like)
 IMPLEMENT_STATELESS(index_select)
-IMPLEMENT_STATELESS(addmm)
-IMPLEMENT_STATELESS(addmv)
-IMPLEMENT_STATELESS(addr)
+IMPLEMENT_STATELESS(take)
 IMPLEMENT_STATELESS(ger)
 IMPLEMENT_STATELESS(mv)
-IMPLEMENT_STATELESS(addbmm)
-IMPLEMENT_STATELESS(baddbmm)
-IMPLEMENT_STATELESS(addcmul)
-IMPLEMENT_STATELESS(addcdiv)
 IMPLEMENT_STATELESS(mm)
 IMPLEMENT_STATELESS(bmm)
 // TODO: this doesn't implement options that return numbers!
@@ -331,45 +366,23 @@ IMPLEMENT_STATELESS(orgqr)
 IMPLEMENT_STATELESS(ormqr)
 IMPLEMENT_STATELESS(btrifact)
 IMPLEMENT_STATELESS(btrisolve)
+IMPLEMENT_STATELESS(gt)
+IMPLEMENT_STATELESS(lt)
+IMPLEMENT_STATELESS(ge)
+IMPLEMENT_STATELESS(le)
+IMPLEMENT_STATELESS(eq)
+IMPLEMENT_STATELESS(ne)
+
+IMPLEMENT_STATELESS_ADDXX(addmm)
+IMPLEMENT_STATELESS_ADDXX(addmv)
+IMPLEMENT_STATELESS_ADDXX(addr)
+IMPLEMENT_STATELESS_ADDXX(addbmm)
+IMPLEMENT_STATELESS_ADDXX(baddbmm)
+IMPLEMENT_STATELESS_ADDXX(addcmul)
+IMPLEMENT_STATELESS_ADDXX(addcdiv)
 
 #undef IMPLEMENT_STATELESS
-
-// For logical functions a reverse type search is required (if the first argument
-// is a ByteTensor (result), it shouldn't pick it's version).
-#define IMPLEMENT_STATELESS_REVERSED(name)                                     \
-static PyObject * TH_CONCAT_2(THPModule_, name)(PyObject *_unused, PyObject *args, PyObject *kwargs) \
-{                                                                              \
-  PyObject *tensor = THPDefaultTensorClass;                                    \
-  PyObject *key, *value;                                                       \
-  Py_ssize_t pos = 0;                                                          \
-  for (int i = PyTuple_Size(args)-1; i >= 0; i--) {                            \
-    PyObject *item = PyTuple_GET_ITEM(args, i);                                \
-    if (THPModule_isTensor(item) || THPVariable_Check(item)) {                 \
-      tensor = item;                                                           \
-      goto dispatch;                                                           \
-    }                                                                          \
-  }                                                                            \
-  if (kwargs) {                                                                \
-    while (PyDict_Next(kwargs, &pos, &key, &value)) {                          \
-      if (THPModule_isTensor(value) || THPVariable_Check(value)) {             \
-        tensor = value;                                                        \
-        goto dispatch;                                                         \
-      }                                                                        \
-    }                                                                          \
-  }                                                                            \
-                                                                               \
-dispatch:                                                                      \
-  return THPUtils_dispatchStateless(tensor, #name, args, kwargs);              \
-}
-
-IMPLEMENT_STATELESS_REVERSED(gt)
-IMPLEMENT_STATELESS_REVERSED(lt)
-IMPLEMENT_STATELESS_REVERSED(ge)
-IMPLEMENT_STATELESS_REVERSED(le)
-IMPLEMENT_STATELESS_REVERSED(eq)
-IMPLEMENT_STATELESS_REVERSED(ne)
-
-#undef IMPLEMENT_STATELESS
+#undef IMPLEMENT_STATELESS_ADDXX
 
 // In nonzero, the first argument might be a LongTensor that will be used
 // for indices output, so we should pick a function based on second
@@ -483,7 +496,7 @@ PyObject *THPModule_addDocStr(PyObject *_unused, PyObject *args)
 PyObject *THPModule_inferSize(PyObject *_unused, PyObject *args)
 {
   HANDLE_TH_ERRORS
-  Py_ssize_t num_args = args ? PyTuple_Size(args) : 0;
+  Py_ssize_t num_args = args ? (Py_ssize_t) PyTuple_Size(args) : 0;
   THPUtils_assert(num_args == 2, "expected exactly 2 arguments");
   PyObject *arg1 = PyTuple_GET_ITEM(args, 0);
   THPUtils_assert(THPSize_Check(arg1), "expected a torch.Size as argument 1");
@@ -671,6 +684,7 @@ static PyMethodDef TorchMethods[] = {
   {"ones",            (PyCFunction)THPModule_ones,              METH_VARARGS | METH_KEYWORDS, NULL},
   {"ones_like",       (PyCFunction)THPModule_ones_like,         METH_VARARGS | METH_KEYWORDS, NULL},
   {"index_select",    (PyCFunction)THPModule_index_select,      METH_VARARGS | METH_KEYWORDS, NULL},
+  {"take",            (PyCFunction)THPModule_take,              METH_VARARGS | METH_KEYWORDS, NULL},
   {"addmm",           (PyCFunction)THPModule_addmm,             METH_VARARGS | METH_KEYWORDS, NULL},
   {"addmv",           (PyCFunction)THPModule_addmv,             METH_VARARGS | METH_KEYWORDS, NULL},
   {"addr",            (PyCFunction)THPModule_addr,              METH_VARARGS | METH_KEYWORDS, NULL},

@@ -47,7 +47,7 @@ class _ConvNd(Module):
             self.bias.data.uniform_(-stdv, stdv)
 
     def __repr__(self):
-        s = ('{name}({in_channels}, {out_channels}, kernel_size={kernel_size}'
+        s = ('{name} ({in_channels}, {out_channels}, kernel_size={kernel_size}'
              ', stride={stride}')
         if self.padding != (0,) * len(self.padding):
             s += ', padding={padding}'
@@ -104,6 +104,16 @@ class Conv1d(_ConvNd):
          `cross-correlation`_, and not a full `cross-correlation`_.
          It is up to the user to add proper padding.
 
+    .. note::
+
+         The configuration when `groups == in_channels` and `out_channels = K * in_channels`
+         where `K` is a positive integer is termed in literature as depthwise convolution.
+
+         In other words, for an input of size :math:`(N, C_{in}, L_{in})`, if you want a
+         depthwise convolution with a depthwise multiplier `K`,
+         then you use the constructor arguments
+         :math:`(in\_channels=C_{in}, out\_channels=C_{in} * K, ..., groups=C_{in})`
+
     Args:
         in_channels (int): Number of channels in the input image
         out_channels (int): Number of channels produced by the convolution
@@ -115,7 +125,7 @@ class Conv1d(_ConvNd):
             elements. Default: 1
         groups (int, optional): Number of blocked connections from input
             channels to output channels. Default: 1
-        bias (bool, optional): If True, adds a learnable bias to the output. Default: True
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
 
     Shape:
         - Input: :math:`(N, C_{in}, L_{in})`
@@ -203,6 +213,16 @@ class Conv2d(_ConvNd):
          and not a full `cross-correlation`_.
          It is up to the user to add proper padding.
 
+    .. note::
+
+         The configuration when `groups == in_channels` and `out_channels = K * in_channels`
+         where `K` is a positive integer is termed in literature as depthwise convolution.
+
+         In other words, for an input of size :math:`(N, C_{in}, H_{in}, W_{in})`, if you want a
+         depthwise convolution with a depthwise multiplier `K`,
+         then you use the constructor arguments
+         :math:`(in\_channels=C_{in}, out\_channels=C_{in} * K, ..., groups=C_{in})`
+
     Args:
         in_channels (int): Number of channels in the input image
         out_channels (int): Number of channels produced by the convolution
@@ -211,7 +231,7 @@ class Conv2d(_ConvNd):
         padding (int or tuple, optional): Zero-padding added to both sides of the input. Default: 0
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        bias (bool, optional): If True, adds a learnable bias to the output. Default: True
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
 
     Shape:
         - Input: :math:`(N, C_{in}, H_{in}, W_{in})`
@@ -300,6 +320,16 @@ class Conv3d(_ConvNd):
          and not a full `cross-correlation`_.
          It is up to the user to add proper padding.
 
+    .. note::
+
+         The configuration when `groups == in_channels` and `out_channels = K * in_channels`
+         where `K` is a positive integer is termed in literature as depthwise convolution.
+
+         In other words, for an input of size :math:`(N, C_{in}, D_{in}, H_{in}, W_{in})`, if you want a
+         depthwise convolution with a depthwise multiplier `K`,
+         then you use the constructor arguments
+         :math:`(in\_channels=C_{in}, out\_channels=C_{in} * K, ..., groups=C_{in})`
+
     Args:
         in_channels (int): Number of channels in the input image
         out_channels (int): Number of channels produced by the convolution
@@ -308,7 +338,7 @@ class Conv3d(_ConvNd):
         padding (int or tuple, optional): Zero-padding added to all three sides of the input. Default: 0
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        bias (bool, optional): If True, adds a learnable bias to the output. Default: True
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
 
     Shape:
         - Input: :math:`(N, C_{in}, D_{in}, H_{in}, W_{in})`
@@ -395,7 +425,7 @@ class _ConvTransposeMixin(object):
 
 
 class ConvTranspose1d(_ConvTransposeMixin, _ConvNd):
-    """Applies a 1D transposed convolution operator over an input image
+    r"""Applies a 1D transposed convolution operator over an input image
     composed of several input planes.
 
     This module can be seen as the gradient of Conv1d with respect to its input.
@@ -434,7 +464,7 @@ class ConvTranspose1d(_ConvTransposeMixin, _ConvNd):
         padding (int or tuple, optional): Zero-padding added to both sides of the input. Default: 0
         output_padding (int or tuple, optional): Zero-padding added to one side of the output. Default: 0
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        bias (bool, optional): If True, adds a learnable bias to the output. Default: True
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
 
     Shape:
@@ -513,7 +543,7 @@ class ConvTranspose2d(_ConvTransposeMixin, _ConvNd):
         padding (int or tuple, optional): Zero-padding added to both sides of the input. Default: 0
         output_padding (int or tuple, optional): Zero-padding added to one side of the output. Default: 0
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        bias (bool, optional): If True, adds a learnable bias to the output. Default: True
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
 
     Shape:
@@ -620,7 +650,7 @@ class ConvTranspose3d(_ConvTransposeMixin, _ConvNd):
         padding (int or tuple, optional): Zero-padding added to all three sides of the input. Default: 0
         output_padding (int or tuple, optional): Zero-padding added to one side of the output. Default: 0
         groups (int, optional): Number of blocked connections from input channels to output channels. Default: 1
-        bias (bool, optional): If True, adds a learnable bias to the output. Default: True
+        bias (bool, optional): If ``True``, adds a learnable bias to the output. Default: ``True``
         dilation (int or tuple, optional): Spacing between kernel elements. Default: 1
 
     Shape:

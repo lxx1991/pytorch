@@ -11,6 +11,7 @@
 #include "torch/csrc/autograd/python_engine.h"
 #include "torch/csrc/autograd/python_variable.h"
 #include "torch/csrc/autograd/python_function.h"
+#include "torch/csrc/jit/generated/aten_dispatch.h"
 #ifdef WITH_CUDA
 #include "torch/csrc/jit/fusion_compiler.h"
 #endif
@@ -115,20 +116,35 @@ struct EmitNull : public Function {
   };
 };
 
-// A hack that will let us implement some of the ops we care
-// about before the major Python -> C++ Function migration
 struct LambdaFunction : public Function {
+  LambdaFunction(const jit::TensorOp& op)
+    : LambdaFunction(op.num_inputs, nullptr) {
+    auto & real_op = op.op;
+    this->fn_ = [real_op](const variable_list& inputs) -> variable_list {
+      std::vector<at::Tensor> tinputs(inputs.begin(), inputs.end());
+      std::vector<at::Tensor> toutputs;
+      real_op(tinputs, toutputs);
+      return variable_list(toutputs.begin(), toutputs.end());
+    };
+    this->name_ = op.name;
+  }
+
   LambdaFunction(int num_inputs, std::function<variable_list(const variable_list&)> fn)
-    : fn(fn) {
+    : fn_(fn) {
     this->is_executable = true;
     this->num_inputs = num_inputs;
   }
 
-  virtual variable_list apply(const variable_list& inputs) {
-    return fn(inputs);
+  virtual std::string name() override {
+    return name_.size() == 0 ? "LambdaFunction" : name_;
   }
 
-  std::function<variable_list(const variable_list&)> fn;
+  virtual variable_list apply(const variable_list& inputs) override {
+    return fn_(inputs);
+  }
+
+  std::string name_;
+  std::function<variable_list(const variable_list&)> fn_;
 };
 
 // Wraps a PythonOp and dispatches calls to Functions implemented in Python
@@ -270,10 +286,6 @@ struct FusionGroupFunction : public Function {
       data.push_back(input.data());
     AutoGPU guard(data.back());
     std::vector<at::Tensor> outputs;
-    outputs.reserve(function->outputDescriptors().size());
-    for(auto & od : function->outputDescriptors()) {
-      outputs.push_back(at::CUDA(od.scalar_type).tensor());
-    }
     function->launch(data, outputs);
     return wrap_outputs(inputs, std::move(outputs), [](FunctionFlags f) {
       return std::make_shared<torch::autograd::Error>("FusionGroupFunction is not differentiable", std::move(f));
@@ -387,20 +399,21 @@ struct CrossStageStateDesc {
   //
   // We have pointers to the caret'ed nodes.
   std::vector<Node*> stage_begins;
-  std::vector<std::vector<Node*>> stage_inputs;
-  std::vector<std::vector<Node*>> stage_outputs;
+  std::vector<std::vector<Value*>> stage_inputs;
+  std::vector<std::vector<Value*>> stage_outputs;
   // A set of all Nodes from previous stage that pass anything (both Variables
   // and handles) to current stage.
-  std::vector<std::unordered_set<Node*>> prev_stage_inputs;
+  std::vector<std::unordered_set<Value*>> prev_stage_inputs;
   // A set of all Nodes from this stage, that need their values to be captured
   // for future stages (applies to both Variables and handles).
-  std::vector<std::unordered_set<Node*>> cur_stage_captures;
+  std::vector<std::unordered_set<Value*>> cur_stage_captures;
 };
 
 // Creates a graph for a given stage and stores information necessary to construct
 // an AutogradClosure with it
 struct StageClosure {
   using node_fn_map_type = std::unordered_map<Node*, std::shared_ptr<Function>>;
+  using value_fn_map_type = std::unordered_map<Value*, std::shared_ptr<Function>>;
 
   StageClosure(TracingState *state, const CrossStageStateDesc& xstate, std::size_t stage)
     : var_flags(state->var_flags.at(stage))
@@ -409,7 +422,7 @@ struct StageClosure {
     node_fn_map_type node_map;
     // This map caches PrevStageInputs for a given node, so that you don't
     // create multiple PrevStageInput for the same node.
-    node_fn_map_type prev_stage_input_map;
+     value_fn_map_type prev_stage_input_map;
 
     // Prepare output node and compute an offset within return node inputs where
     // nodes from this stage apear.
@@ -444,14 +457,22 @@ struct StageClosure {
               end = std::next(xstate.stage_begins[stage]->reverseIterator()); it != end; ++it) {
       add_node(*it);
     }
-    for (auto node : xstate.stage_inputs[stage]) {
-      add_node(node);
+
+    value_fn_map_type input_placeholders;
+    // Prepare inputs.
+    for (Value *input : xstate.stage_inputs[stage]) {
+      JIT_ASSERT(input->stage() == stage);
+      auto fn = std::make_shared<InputPlaceholder>();
+      fn->num_inputs = 1;
+      // Initialize function fields
+      fn->is_executable = true;
+      std::vector<std::reference_wrapper<const use_list>> output_uses_refs;
+      output_uses_refs.emplace_back(input->uses());
+      fillNextFunctions(input->owningGraph(), output_uses_refs, fn, node_map, output_offset, stage);
+      roots.emplace_back(fn, 0);
+      input_placeholders[input] = fn;
     }
 
-    // Prepare inputs.
-    for (Node *input : xstate.stage_inputs[stage]) {
-      roots.emplace_back(node_map.at(input), 0);
-    }
     for (auto & entry : prev_stage_input_map) {
       roots.emplace_back(entry.second, 0);
       prev_stage_variables.emplace_back(entry.first->unique());
@@ -461,18 +482,15 @@ struct StageClosure {
 
     // Prepare a list of values / handles to capture
     for (auto captured_node : xstate.cur_stage_captures[stage]) {
-      if (captured_node->kind() == kSelect) {
-        auto & fn = node_map.at(captured_node->input());
-        if (captured_node->type()->kind() == TypeKind::TensorType) {
-          captured_variables.emplace_back(fn.get(), captured_node->i(kOffset), captured_node->unique());
-        } else {
-          JIT_ASSERT(captured_node->type()->kind() == TypeKind::HandleType);
-          captured_handles.emplace(fn.get(), captured_node->unique());
-        }
+      auto & fn = (input_placeholders.count(captured_node) > 0)
+        ? input_placeholders.at(captured_node)
+        : node_map.at(captured_node->node());
+      size_t offset = captured_node->node()->kind() == kParam ? 0 : captured_node->offset();
+      if (captured_node->type()->kind() == TypeKind::TensorType) {
+        captured_variables.emplace_back(fn.get(), offset, captured_node->unique());
       } else {
-        JIT_ASSERT(captured_node->type()->kind() == TypeKind::TensorType);
-        auto & fn = node_map.at(captured_node);
-        captured_variables.emplace_back(fn.get(), 0, captured_node->unique());
+        JIT_ASSERT(captured_node->type()->kind() == TypeKind::HandleType);
+        captured_handles.emplace(fn.get(), captured_node->unique());
       }
     }
 
@@ -492,7 +510,7 @@ struct StageClosure {
 
         // All Eval nodes take context edges as an input, and we need to register
         // all such places
-        auto & inputs = value->inputs();
+        auto inputs = value->inputs();
         JIT_ASSERT(inputs.size() > 0);
         auto handle_input = inputs[inputs.size() - 1];
         JIT_ASSERT(handle_input->type()->kind() == TypeKind::HandleType);
@@ -506,10 +524,6 @@ struct StageClosure {
     IR_ELSEIF(Select)
       // No-op. Selects are handled by their inputs.
       return nullptr;
-#define IR_ELSEIF_TRIVIAL(NAME, FNAME) IR_ELSEIF(NAME) return std::make_shared<FNAME>();
-    IR_ELSEIF_TRIVIAL(Add, Add)
-    IR_ELSEIF_TRIVIAL(Mul, Mul)
-#undef IR_ELSEIF_TRIVIAL
     IR_ELSEIF(FusionGroup)
 #ifdef WITH_CUDA
       // TODO: make this more robust - handle device and contiguity changes!
@@ -518,10 +532,6 @@ struct StageClosure {
 #else
       throw std::runtime_error("don't know how to execute FusionGroups without CUDA");
 #endif
-    IR_ELSEIF(Param)
-      auto fn = std::make_shared<InputPlaceholder>();
-      fn->num_inputs = 1;
-      return fn;
     IR_ELSEIF(Constant)
       auto fn = std::make_shared<torch::autograd::WrapConstant>(value->t(kvalue));
       const_factory->next_functions.emplace_back(fn, 0);
@@ -541,49 +551,14 @@ struct StageClosure {
       return std::make_shared<LambdaFunction>(1, [shape](const variable_list& vars) -> variable_list {
         return {make_variable(vars[0].data().view(shape), vars[0].requires_grad())};
       });
-    IR_ELSEIF(Tanh)
-      return std::make_shared<LambdaFunction>(1, [](const variable_list& vars) -> variable_list {
-        return {make_variable(vars[0].data().tanh(), vars[0].requires_grad())};
-      });
-    IR_ELSEIF(Sigmoid)
-      return std::make_shared<LambdaFunction>(1, [](const variable_list& vars) -> variable_list {
-        return {make_variable(vars[0].data().sigmoid(), vars[0].requires_grad())};
-      });
-    IR_ELSEIF(AddConstant)
-      auto c = value->f(kvalue);
-      return std::make_shared<LambdaFunction>(1, [c](const variable_list& vars) -> variable_list {
-        return {vars[0].add(c)};
-      });
-    IR_ELSEIF(SubConstant)
-      auto c = value->f(kvalue);
-      return std::make_shared<LambdaFunction>(1, [c](const variable_list& vars) -> variable_list {
-        return {vars[0].sub(c)};
-      });
-    IR_ELSEIF(Scale)
-      auto c = value->f(kscale);
-      return std::make_shared<LambdaFunction>(1, [c](const variable_list& vars) -> variable_list {
-        return {vars[0].mul(c)};
-      });
-    IR_ELSEIF(Neg)
-      return std::make_shared<LambdaFunction>(1, [](const variable_list& vars) -> variable_list {
-        return {vars[0].neg()};
-      });
     IR_ELSEIF(Gemm)
       auto beta = value->f(kbeta);
       auto alpha = value->f(kalpha);
       return std::make_shared<LambdaFunction>(3, [beta, alpha](const variable_list& vars) -> variable_list {
         return {vars[2].addmm(vars[0], vars[1], beta, alpha)};
       });
-    IR_ELSEIF(Split)
-      auto dim = value->i(kaxis);
-      auto splits = value->is(ksplit);
-      if (!std::equal(splits.begin() + 1, splits.end(), splits.begin()))
-        throw std::runtime_error("Don't know how to compile Split with different output shapes");
-      return std::make_shared<torch::autograd::Chunk>(splits.size(), dim);
-    IR_ELSEIF(Concat)
-      return std::make_shared<torch::autograd::Cat>(value->i(kaxis));
     IR_ELSE()
-      throw std::runtime_error(std::string("unrecognized NodeKind: ") + symbolToString(node->kind()));
+      return std::make_shared<LambdaFunction>(getTensorOp(node));
     IR_END()
   }
 
@@ -592,17 +567,14 @@ struct StageClosure {
     auto graph = node->owningGraph();
     // Gather uses of each output
     std::vector<std::reference_wrapper<const use_list>> output_uses_refs;
-    if (node->hasMultipleOutputs()) {
-      // Each use is a single Select node corresponding to an output
-      for (auto& use : node->uses()) {
-        if (use.user->isHandle()) continue;
-        auto& select_uses = use.user->uses();
-        output_uses_refs.emplace_back(select_uses);
-      }
-    } else {
-      output_uses_refs.emplace_back(node->uses());
+    for (auto o : node->outputs()) {
+      if (o->isHandle()) continue;
+      auto& select_uses = o->uses();
+      output_uses_refs.emplace_back(select_uses);
     }
-
+    fillNextFunctions(graph, output_uses_refs, fn, node_map, output_offset, stage);
+  }
+  void fillNextFunctions(Graph * graph, std::vector<std::reference_wrapper<const use_list>> & output_uses_refs, const std::shared_ptr<Function>& fn, node_fn_map_type& node_map, int output_offset, std::size_t stage) {
     // Fill next_functions accordingly to uses of each output
     // There's some fiddling required for fixing the offset of uses for return node, so it's
     // better to keep this logic in a lambda.
@@ -632,7 +604,7 @@ struct StageClosure {
   // Possibly create PrevStageInputs for any uses of nodes from previous
   // stages, and fill in their next_functions with our use.
   void registerPrevStageInputs(Node *node, const std::shared_ptr<Function>& fn,
-                               node_fn_map_type& prev_stage_input_map) {
+                               value_fn_map_type & prev_stage_input_map) {
     const auto& inputs = node->inputs();
     for (std::size_t i = 0; i < inputs.size(); ++i) {
       auto input_node = inputs[i];
@@ -671,7 +643,7 @@ struct StageClosure {
   // Roots for a call to the engine. The list contains function in this order:
   // [ apply input roots | prev stage input roots | constant factory ]
   function_list roots;
-  std::vector<VariableFlags> var_flags;
+  std::pair<std::vector<VariableFlags>, std::vector<VariableFlags>> var_flags;
 
   // Output node
   std::shared_ptr<Function> output;
@@ -703,15 +675,14 @@ struct MultiStageClosure {
 };
 
 AutogradClosure::AutogradClosure(const std::shared_ptr<MultiStageClosure>& desc)
-  : AutogradClosure(desc, 0, {}) {}
+  : AutogradClosure(desc, 0) {}
 
 // TODO: there's a lot processing involved in creating a new AutogradClosure instance,
 // so it might be worth to keep a pool of unused instances (or at least their attrs)
 // for all stages. We can't save saved_vars and saved_handles, but all callbacks
 // can be made reusable.
-AutogradClosure::AutogradClosure(const std::shared_ptr<MultiStageClosure>& desc, std::size_t stage, FunctionFlags &&f)
-  : Function(std::move(f))
-  , desc(desc)
+AutogradClosure::AutogradClosure(const std::shared_ptr<MultiStageClosure>& desc, std::size_t stage)
+  : desc(desc)
   , stage(stage) {
   auto & stage_desc = desc->stages[stage];
 
@@ -777,10 +748,10 @@ variable_list AutogradClosure::apply(const variable_list& inputs) {
 
   // Validate inputs
   auto num_inputs = inputs.size();
-  if (num_inputs != stage_closure.var_flags.size())
+  if (num_inputs != stage_closure.var_flags.first.size())
     throw std::runtime_error("AutogradClosure received an incorrect number of inputs");
   for (std::size_t i = 0; i < num_inputs; ++i) {
-    auto & flags = stage_closure.var_flags[i];
+    auto & flags = stage_closure.var_flags.first[i];
     if (!flags.verify(inputs[i]))
       throw std::runtime_error("AutogradClosure received inputs with different flags");
   }
@@ -797,16 +768,15 @@ variable_list AutogradClosure::apply(const variable_list& inputs) {
   auto& engine = python::PythonEngine::getDefaultEngine();
   engine.execute(stage_closure.roots, input_leaves, true, pre_callbacks, post_callbacks);
 
-  // See Note [Null-edge pruning]
-  auto relevant_inputs = filter(inputs, [](const Variable& var) { return var.defined() && var.requires_grad(); });
-  auto result = wrap_outputs(relevant_inputs, std::move(outputs), [this](FunctionFlags f) -> std::shared_ptr<Function> {
+  // Create the backward function lazily
+  auto make_grad_fn = [this]() -> std::shared_ptr<Function> {
     if (this->stage == this->desc->stages.size() - 1) {
       std::string msg = "JIT closure compiled only for ";
       msg += std::to_string(this->stage);
       msg += " backwards";
-      return std::make_shared<Error>(std::move(msg), std::move(f));
+      return std::make_shared<Error>(std::move(msg));
     }
-    auto bw_fn = std::shared_ptr<AutogradClosure>(new AutogradClosure(this->desc, this->stage + 1, std::move(f)));
+    auto bw_fn = std::shared_ptr<AutogradClosure>(new AutogradClosure(this->desc, this->stage + 1));
     // TODO: don't make a full copy of saved_* - copy only the things that bw needs
     bw_fn->saved_vars = this->saved_vars;
     bw_fn->saved_vars.insert(std::make_move_iterator(this->captured_vars.begin()),
@@ -824,7 +794,33 @@ variable_list AutogradClosure::apply(const variable_list& inputs) {
     // was run, so it must have been executable).
     bw_fn->is_executable = true;
     return bw_fn;
-  });
+  };
+
+  // See Note [Null-edge pruning]
+  variable_list result;
+  auto num_outputs = outputs.size();
+  std::shared_ptr<Function> grad_fn;
+  JIT_ASSERT(outputs.size() == stage_closure.var_flags.second.size());
+  for (std::size_t i = 0; i < num_outputs; ++i) {
+    auto & flags = stage_closure.var_flags.second[i];
+    if (flags.requires_grad) {
+      if (!grad_fn) grad_fn = make_grad_fn();
+      result.push_back(make_variable(outputs[i], grad_fn));
+    } else {
+      result.push_back(make_variable(outputs[i], flags.requires_grad, flags.is_volatile));
+    }
+  }
+
+  // If we created grad_fn for any of the outputs, we also need to fill in next_functions
+  if (grad_fn) {
+    for (auto & input : inputs) {
+      if (!input.requires_grad()) continue;
+      grad_fn->next_functions.emplace_back(
+        input.grad_fn() ? input.grad_fn() : input.grad_accumulator(),
+        input.output_nr());
+    }
+  }
+
   captured_vars.clear();
   captured_handles.clear();
   outputs.clear();

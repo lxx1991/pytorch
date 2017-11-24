@@ -1,12 +1,20 @@
 #include "Functions.h"
+#include <ATen/WrapDimUtils.h>
 
+// define constants like M_PI and C keywords for MSVC
+#ifdef _MSC_VER
+#define _USE_MATH_DEFINES
+#include <ciso646>
+#endif
 #include <math.h>
+#include <algorithm>
 
 // ${generated_comment}
 
 using at::Tensor;
 using at::Scalar;
 using at::IntList;
+using at::TensorList;
 
 namespace torch { namespace autograd { namespace generated {
 
@@ -15,6 +23,11 @@ namespace {
 Tensor not_implemented(const char* name) {
   throw std::runtime_error(
       std::string("the derivative for '") + name + "' is not implemented");
+}
+
+Tensor not_differentiable(const char* name) {
+  throw std::runtime_error(
+      std::string("'") + name + "' is not differentiable");
 }
 
 Tensor maybe_multiply(const Tensor & t, const Scalar & s) {
@@ -32,46 +45,40 @@ Tensor maybe_multiply(const Tensor & t, const Scalar & s) {
   }
 }
 
-Tensor norm_backward(const Tensor & grad, const Tensor & self, const Scalar & p_) {
-  auto p = p_.toDouble();
-  auto norm = self.norm(p_);
-
-  if (norm.toDouble() == 0.0) {
-    // handle case at 0 where we return a subgradient containing 0
+Tensor norm_backward(const Tensor & grad, const Tensor & self, const Scalar & p_, const Tensor & norm) {
+  double p = p_.toDouble();
+  Tensor self_scaled;
+  Tensor scale_v;
+  if (p == 0.0) {
     return zeros_like(self);
-  }
-
-  if (p == 2.0) {
-    return self * (grad / norm);
+  } else if (p == 1.0) {
+    return self.sign() * grad;
+  } else if (p < 2.0) {
+    self_scaled = self.sign() * self.abs().pow(p - 1);
+    scale_v = grad / norm.pow(p - 1);
+  } else if (p == 2.0) {
+    self_scaled = self;
+    scale_v = grad / norm;
   } else {
-    auto pow_ = self.abs().pow(p - 2);
-    auto scale_v = grad / norm.toTensor().pow(p - 1);
-    return self * pow_ * scale_v;
-  }
-}
-
-Tensor norm_backward(Tensor grad, const Tensor & self, const Scalar & p_, int64_t dim, bool keepdim) {
-  if (!keepdim && self.dim() > 1) {
-    grad = grad.unsqueeze(dim);
-  }
-  auto p = p_.toDouble();
-  auto norm = self.norm(p, dim, true);
-  Tensor grad_input;
-  if (p == 2.0) {
-    grad_input = self * (grad / norm);
-  } else {
-    auto pow_ = self.abs().pow(p - 2);
-    auto scale_v = grad / norm.pow(p - 1);
-    grad_input = self * pow_ * scale_v;
+    self_scaled = self * self.abs().pow(p - 2);
+    scale_v = grad / norm.pow(p - 1);
   }
   // handle case at 0 where we return a subgradient containing 0
-  grad_input.masked_fill_(norm == 0, 0);
-  return grad_input;
+  scale_v.masked_fill_(norm == 0, 0);
+  return self_scaled * scale_v;
+}
+
+Tensor norm_backward(Tensor grad, const Tensor & self, const Scalar & p_, Tensor norm, int64_t dim, bool keepdim) {
+  if (!keepdim && self.dim() > 1) {
+    grad = grad.unsqueeze(dim);
+    norm = norm.unsqueeze(dim);
+  }
+  return norm_backward(grad, self, p_, norm);
 }
 
 Tensor reduce_to(const Tensor & grad, IntList sizes) {
   if (sizes.size() == 0) {
-    return grad.sum().toTensor();
+    return grad.sum();
   }
   Tensor result = grad;
   while (result.dim() > (int64_t)sizes.size()) {
@@ -83,6 +90,15 @@ Tensor reduce_to(const Tensor & grad, IntList sizes) {
     }
   }
   return result;
+}
+
+Tensor permute_backwards(const Tensor & grad, IntList fwd_dims) {
+  // invert the permutation
+  std::vector<int64_t> dims(fwd_dims.size());
+  for (size_t i = 0; i < fwd_dims.size(); i++) {
+    dims[fwd_dims[i]] = i;
+  }
+  return grad.permute(dims);
 }
 
 Tensor sum_backward(const Tensor & grad, IntList sizes, int64_t dim, bool keepdim) {
@@ -112,36 +128,11 @@ Tensor unsqueeze_to(const Tensor & self, IntList sizes) {
   return result;
 }
 
-Tensor maybe_unsqueeze(const Tensor & self, int64_t dim, int64_t prev_size) {
-  if (prev_size == 1) {
+Tensor maybe_unsqueeze(const Tensor & self, int64_t dim, bool unsqueeze) {
+  if (unsqueeze) {
     return self.unsqueeze(dim);
   }
   return self;
-}
-
-Tensor addmm_self_backward(const Tensor & grad, const Scalar &beta) {
-  return maybe_multiply(grad, beta);
-}
-
-Tensor addmm_mat1_backward(const Tensor & grad, const Tensor & mat1, const Tensor & mat2, const Scalar & alpha) {
-  auto mat1Strides = mat1.strides();
-  auto mat1Sizes = mat1.sizes();
-  if (mat1Strides[0] == 1 && mat1Strides[1] == mat1Sizes[0]) {
-    return maybe_multiply(mat2.mm(grad.t()).t(), alpha);
-  } else {
-    return maybe_multiply(grad.mm(mat2.t()), alpha);
-  }
-}
-
-Tensor addmm_mat2_backward(const Tensor & grad, const Tensor & mat1, const Tensor & mat2, const Scalar & alpha) {
-  auto mat2Strides = mat2.strides();
-  auto mat2Sizes = mat2.sizes();
-
-  if (mat2Strides[0] == 1 && mat2Strides[1] == mat2Sizes[0]) {
-    return maybe_multiply(grad.t().mm(mat1).t(), alpha);
-  } else {
-    return maybe_multiply(mat1.t().mm(grad), alpha);
-  }
 }
 
 variable_list cat_tensors_backward(const Tensor & grad, const std::vector<int64_t> &sizes, int64_t dim) {
@@ -155,13 +146,28 @@ variable_list cat_tensors_backward(const Tensor & grad, const std::vector<int64_
   return grad_inputs;
 }
 
-Tensor select_backward_scalar(Tensor grad, const Tensor & input, const Tensor & value) {
-  if (grad.dim() == 1) {
-    // TODO: remove this once zero-dim tensor work properly in PyTorch
-    grad = grad.view({});
+Tensor mm_mat1_backward(const Tensor & grad, const Tensor & mat2, IntList sizes, IntList strides, const Scalar & alpha) {
+  // if input was column-major, return grad as column-order for efficiency
+  if (strides[0] == 1 && strides[1] == sizes[0]) {
+    return maybe_multiply(mat2.mm(grad.t()).t(), alpha);
+  } else {
+    return maybe_multiply(grad.mm(mat2.t()), alpha);
   }
+}
+
+Tensor mm_mat2_backward(const Tensor & grad, const Tensor & mat1, IntList sizes, IntList strides, const Scalar & alpha) {
+  // if input was column-major, return grad as column-order for efficiency
+  if (strides[0] == 1 && strides[1] == sizes[0]) {
+    return maybe_multiply(grad.t().mm(mat1).t(), alpha);
+  } else {
+    return maybe_multiply(mat1.t().mm(grad), alpha);
+  }
+}
+
+Tensor select_backward_scalar(Tensor grad, const Tensor & input, const Tensor & value) {
+  auto grad_data = static_cast<Variable&>(grad).data();
   auto grad_input = zeros_like(input);
-  grad_input.masked_fill_(input == value, Scalar(grad));
+  grad_input.masked_fill_(input == value, Scalar(grad_data[0]));
   return grad_input;
 }
 
@@ -178,20 +184,18 @@ Tensor trace_backward(const Tensor & grad, IntList sizes) {
     throw std::runtime_error("expected matrix input");
   }
 
-  // TODO: simplify once toScalarType is virtual
-  auto& long_type = *VariableImpl::getType(
-      Variable(grad).data().type().toScalarType(at::kLong));
+  // TODO: simplify once index_fill_(Tensor) is implemented on Variable
+  auto grad_data = static_cast<const Variable&>(grad).data();
+  auto& long_type = grad.type().toScalarType(at::kLong);
 
   auto grad_input = grad.type().zeros(sizes[0] * sizes[1]);
   auto indices = long_type.arange(0, grad_input.numel(), sizes[1] + 1);
-  grad_input.index_fill_(0, indices, Scalar(grad.view({})));
+  grad_input.index_fill_(0, indices, Scalar(grad_data[0]));
   return grad_input.view(sizes);
 }
 
 Tensor unfold_backward(const Tensor & grad, IntList input_sizes, int64_t dim, int64_t size, int64_t step) {
-  // TODO: simplify once toScalarType is virtual
-  auto& long_type = *VariableImpl::getType(
-      Variable(grad).data().type().toScalarType(at::kLong));
+  auto& long_type = grad.type().toScalarType(at::kLong);
 
   int64_t numel = 1;
   for (auto size : input_sizes) {
@@ -203,6 +207,17 @@ Tensor unfold_backward(const Tensor & grad, IntList input_sizes, int64_t dim, in
   auto grad_input = grad.type().zeros({numel});
   grad_input.index_add_(0, idx_unfolded, grad.contiguous().view(-1));
   return grad_input.view(input_sizes);
+}
+
+Tensor var_backward(const Tensor & grad, const Tensor & self, bool unbiased) {
+  return (2.0 / (self.numel() - unbiased)) * grad * (self - self.mean());
+}
+
+Tensor var_backward(Tensor grad, const Tensor & self, int64_t dim, bool unbiased, bool keepdim) {
+  if (!keepdim && self.dim() > 1) {
+    grad = grad.unsqueeze(dim);
+  }
+  return (2.0 / (self.size(dim) - unbiased)) * grad * (self - self.mean(dim, true));
 }
 
 Tensor masked_scatter_backward(const Tensor & grad, const Tensor & mask, IntList sizes) {
@@ -246,6 +261,29 @@ Tensor potrf_backward(Tensor grad, bool upper, Tensor L) {
   return S;
 }
 
+Tensor split_backward(const std::vector<torch::autograd::Variable> &grads, int64_t split_size, int64_t dim, IntList sizes, const Type &type) {
+  dim = at::maybe_wrap_dim(dim, sizes.size());
+  int64_t dim_size = sizes[dim];
+  int64_t num_splits = (dim_size + split_size - 1) / split_size;
+
+  // it's possible some of the grads are not defined (represents tensors of all 0s).
+  // Since at::cat can't handle those, let's define them
+  std::vector<Tensor> grads_all_defined(grads.size());
+  for (size_t j = 0; j < grads.size(); ++j) {
+    if (grads[j].defined()) {
+      grads_all_defined[ j ] = grads[ j ];
+    } else {
+      auto length = (int64_t)j < (num_splits - 1) ? split_size : split_size - (split_size * num_splits - dim_size);
+      std::vector<int64_t> grad_size(sizes);
+      grad_size[ dim ] = length;
+      grads_all_defined[ j ] = type.zeros(grad_size);
+    }
+  }
+
+  auto ret =  at::cat(grads_all_defined, dim);
+  return ret;
+}
+
 Tensor glu_double_backward(const Tensor & grad, const Tensor & grad_output, const Tensor & input, int64_t dim) {
   auto& gO = grad_output;
   auto input_size = input.size(dim) / 2;
@@ -271,6 +309,16 @@ Tensor glu_double_backward_grad_output(const Tensor & grad, const Tensor & input
   sizes[dim] /= 2;
   auto tmp = grad * glu_backward(input.type().ones(sizes), input, dim);
   return tmp.narrow(dim, 0, sizes[dim]) + tmp.narrow(dim, sizes[dim], sizes[dim]);
+}
+
+Tensor kl_div_double_backward_grad_output(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
+  auto result = kl_div_backward(grad, input, target, size_average, false);
+  if (reduce && size_average) {
+    return result.mean();
+  } else if (reduce) {
+    return result.sum();
+  }
+  return result;
 }
 
 Tensor log_sigmoid_double_backward(const Tensor & grad, const Tensor & input) {
@@ -300,13 +348,31 @@ Tensor log_softmax_double_backward(const Tensor & grad, const Tensor & grad_outp
   return z * grad_output.sum(dim, true) * ((grad * z).sum(dim, true) - grad);
 }
 
-Tensor smooth_l1_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average) {
+Tensor l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
+  auto output = l1_loss_backward(grad, input, target, size_average, false);
+  if (reduce and size_average) {
+    return output.mean();
+  } else if (reduce) {
+    return output.sum();
+  }
+  return output;
+}
+
+Tensor smooth_l1_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
   auto d = (input - target).abs();
   auto grad_input = grad * (d < 1).toType(grad.type());
-  if (size_average) {
+  if (size_average && reduce) {
     grad_input /= input.numel();
   }
   return grad_input;
+}
+
+Tensor smooth_l1_loss_double_backward_grad_output(const Tensor & grad, const Tensor & grad_output, const Tensor & input, const Tensor & target, bool size_average, bool reduce) {
+  if (!reduce) {
+    return smooth_l1_loss_backward(grad, input, target, size_average, reduce);
+  }
+  auto r = smooth_l1_loss_backward(ones_like(grad_output), input, target, size_average, true);
+  return (r * grad).sum().view({1});
 }
 
 Tensor max_pool2d_double_backward(const Tensor & grad, const Tensor & indices) {
@@ -331,7 +397,7 @@ Tensor mse_loss_double_backward_grad_output(const Tensor & grad, const Tensor & 
     return mse_loss_backward(grad, input, target, size_average, reduce);
   }
   auto r = mse_loss_backward(ones_like(grad_output), input, target, size_average, true);
-  return (r * grad).sum().toTensor().view({1});
+  return (r * grad).sum().view({1});
 }
 
 Tensor soft_margin_loss_double_backward(const Tensor & grad, const Tensor & input, const Tensor & target, bool size_average) {
@@ -347,6 +413,93 @@ Tensor soft_margin_loss_double_backward(const Tensor & grad, const Tensor & inpu
 Tensor softplus_double_backward(const Tensor & grad, const Tensor & input, Scalar beta, Scalar threshold) {
   auto x = (input * beta);
   return _sigmoid_backward(grad, x.sigmoid()) * (x < threshold).toType(grad.type()) * beta;
+}
+
+Tensor as_strided_backward(const Tensor & grad, TensorGeometry base, IntList sizes, IntList strides, int64_t storage_offset) {
+  auto src = base.zeros_with_stride(grad.type());
+  src.as_strided(sizes, strides, storage_offset - base.storage_offset).copy_(grad);
+  return src;
+}
+
+std::tuple<Tensor, Tensor> atan2_backward(const Tensor& grad, const Tensor& self, const Tensor& other, std::array<bool, 2> output_mask) {
+  auto recip = (self * self + other * other).reciprocal();
+  return std::tuple<Tensor,Tensor>{
+            output_mask[0] ? grad * other * recip : Tensor(),
+            output_mask[1] ? grad * -self * recip : Tensor() };
+}
+
+// TODO: Seriously consider writing the derivative formulas for
+// each output separately; there is not all that much sharing
+// of computation going on here.
+std::tuple<Tensor, Tensor, Tensor> prelu_double_backward(
+    const Tensor & mb_ggI,
+    const Tensor & mb_ggW,
+    const Tensor & mb_gO,
+    const Tensor & input,
+    const Tensor & weight,
+    std::array<bool, 3> output_mask) {
+
+  // Zero-fill undefined grads (TODO: do this more efficiently)
+  auto ggI = mb_ggI.defined() ? mb_ggI : input.type().zeros_like(input);
+  auto ggW = mb_ggW.defined() ? mb_ggW : weight.type().zeros_like(weight);
+  auto gO = mb_gO.defined() ? mb_gO : input.type().zeros_like(input);
+
+  auto positive_mask = (input > 0).type_as(ggI);
+  auto nonpositive_mask = (input <= 0).type_as(ggW);
+
+  // Explanation: Let input be i, weight be w, grad_output be gO.
+  // f(i, w) = i  if i > 0
+  //         = wi if i <= 0
+  // df/di * gO  = gO      if i > 0      df/dw * g0 = 0      if i > 0
+  //             = g0 * w  if i <= 0                = g0 * i  if i <= 0
+  // The rest is taking derivatives of these wrt i, w, gO and summing/expanding properly.
+
+  if (weight.numel() == 1) {
+      // from PReLU.forward: num_parameters == 0 is used indicate that a
+      // single weight is shared among all input channels.
+      auto mask = positive_mask + nonpositive_mask * weight.expand_as(input);
+      auto ggO = ggI * mask + ggW.expand_as(gO) * (nonpositive_mask * input);
+      return std::tuple<Tensor, Tensor, Tensor>(
+                ggO,
+                ggW.expand_as(gO) * gO * nonpositive_mask,
+                (ggI * gO * nonpositive_mask).sum()
+          );
+  } else {
+      // Expand ggW to match size of ggI; a simple expand doesn't work because
+      // ggW is the size of the input channel (dim==1 unless there is only 1 dimension).  For example,
+      // let ggI be size (3,4,5,6,7) and ggW be size (4).  Then we unsqueeze ggW to be size (4,1,1,1)
+      // so the expand succeeds.
+      auto dims_to_unsqueeze = std::max<int64_t>(input.dim() - 2, 0);
+      auto ggW_expanded = ggW;
+      for (int64_t i = 0; i < dims_to_unsqueeze; i++) {
+          ggW_expanded = ggW_expanded.unsqueeze(1);
+      }
+      ggW_expanded = ggW_expanded.expand_as(ggI);
+
+      auto gI = ggW_expanded * gO * nonpositive_mask;
+
+      auto gW = ggI * gO * nonpositive_mask;
+      if (input.dim() > 1) {
+          gW = gW.sum(0);
+      }
+      while (gW.dim() > 1) {
+          gW = gW.sum(1);
+      }
+
+      Tensor ggO;
+      if (output_mask[0]) {
+          // expand weight as input as in ggW/ggI above
+          auto weight_expanded = weight;
+          for (int64_t i = 0; i < dims_to_unsqueeze; i++) {
+              weight_expanded = weight_expanded.unsqueeze(1);
+          }
+          weight_expanded = weight_expanded.expand_as(input);
+
+          auto mask = positive_mask + nonpositive_mask * weight_expanded;
+          ggO = ggI * mask + ggW_expanded * nonpositive_mask * input;
+      }
+      return std::tuple<Tensor,Tensor,Tensor>{ggO, gI, gW};
+  }
 }
 
 }

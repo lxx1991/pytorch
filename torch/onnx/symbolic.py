@@ -1,6 +1,7 @@
 import torch
 from torch.autograd._functions.utils import check_onnx_broadcast  # TODO: move me
 from torch.nn.modules.utils import _pair
+import warnings
 
 # EDITING THIS FILE? READ THIS FIRST!
 #
@@ -31,7 +32,7 @@ def _if_scalar_type_as(self, tensor):
     actually need to insert an ONNX cast operator here; just
     fix up the scalar.
     """
-    if isinstance(self, torch._C.Node):
+    if isinstance(self, torch._C.Value):
         return self
     else:
         ty = tensor.type().scalarType().lower()
@@ -40,10 +41,14 @@ def _if_scalar_type_as(self, tensor):
 
 def _broadcast_if_scalar(x):
     """Return kwargs enabling broadcasting if 'x' is a scalar."""
-    if isinstance(x, torch._C.Node):
+    if isinstance(x, torch._C.Value):
         return {}
     else:
         return {"broadcast_i": 1}
+
+
+def _unimplemented(op, msg):
+    warnings.warn("ONNX export failed on " + op + " because " + msg + " not supported")
 
 
 # ---------------------------------------------------------------------
@@ -86,14 +91,14 @@ def _broadcast_if_scalar(x):
 
 def add(g, self, other, alpha):
     if _scalar(alpha) != 1:
-        raise NotImplementedError("add: alpha != 1")
+        return _unimplemented("add", "alpha != 1")
     # See Note [Pointwise by scalar]
     return g.op("Add", self, _if_scalar_type_as(other, self), **_broadcast_if_scalar(other))
 
 
 def sub(g, self, other, alpha):
     if _scalar(alpha) != 1:
-        raise NotImplementedError("sub: alpha != 1")
+        return _unimplemented("sub", "alpha != 1")
     # See Note [Pointwise by scalar]
     return g.op("Sub", self, _if_scalar_type_as(other, self), **_broadcast_if_scalar(other))
 
@@ -108,9 +113,31 @@ def div(g, self, other):
     return g.op("Div", self, _if_scalar_type_as(other, self), **_broadcast_if_scalar(other))
 
 
-# TODO: untested
+# This syntax is Python 2 portable
+def cat(g, *tensors, **kwargs):
+    dim = kwargs.pop("dim")
+    assert not kwargs
+    return g.op("Concat", *tensors, axis_i=dim)
+
+
+def mm(g, self, other):
+    # Create a dummy C tensor. Only needed for API purposes, the value is
+    # since beta = 0
+    ty = self.type().scalarType().lower()
+    C = g.constant(0, [1], ty)
+    return g.op("Gemm", self, other, C, beta_f=0.0, alpha_f=1.0, broadcast_i=True)
+
+
+def bmm(g, self, other):
+    return g.op("MatMul", self, other)
+
+
 def addmm(g, self, mat1, mat2, beta, alpha):
     return g.op("Gemm", mat1, mat2, self, beta_f=_scalar(beta), alpha_f=_scalar(alpha))
+
+
+def neg(g, self):
+    return g.op("Neg", self)
 
 
 def tanh(g, self):
@@ -133,6 +160,11 @@ def t(g, self):
     return g.op("Transpose", self, perm_i=(1, 0))
 
 
+def expand(g, self, size):
+    # TODO: This is not a real ONNX operator at the moment
+    return g.op("Expand", self, shape_i=size)
+
+
 def transpose(g, self, dim0, dim1):
     if dim0 == dim1:  # micro-optimization
         return self
@@ -143,8 +175,23 @@ def transpose(g, self, dim0, dim1):
     return g.op("Transpose", self, perm_i=axes)
 
 
+def permute(g, self, dims):
+    if dims == list(range(0, len(dims))):
+        return self
+    return g.op("Transpose", self, perm_i=dims)
+
+
 def view(g, self, size):
     return g.op("Reshape", self, shape_i=size)
+
+
+def split(g, self, split_size, dim):
+    size = self.type().sizes()[dim]
+    splits = [split_size] * (size // split_size)
+    leftover = size % split_size
+    if leftover:
+        splits.append(leftover)
+    return g.op("Split", self, split_i=splits, axis_i=dim, outputs=len(splits))
 
 
 def squeeze(g, self, dim=None):
@@ -158,22 +205,23 @@ def squeeze(g, self, dim=None):
     return g.op("Squeeze", self, axes_i=dims)
 
 
+# NB: This appears to be dead at the moment
 def prelu(g, input, weight):
     if all(s == 1 for s in weight.type().sizes()):
-        raise RuntimeError("single weight shared among input channels not supported")
+        return _unimplemented("prelu", "single weight shared among input channels")
     return g.op("PRelu", input, weight)
 
 
-def threshold(g, input, threshold, value, inplace):
+def threshold(g, input, threshold, value, inplace=False):
     # See Note [Export inplace]
     if _scalar(threshold) != 0:
-        raise RuntimeError("threshold: Non-zero threshold in Threshold not supported")
+        return _unimplemented("threshold", "non-zero threshold")
     if _scalar(value) != 0:
-        raise RuntimeError("threshold: Non-zero value in Threshold not supported")
+        return _unimplemented("threshold", "non-zero value")
     return g.op("Relu", input)
 
 
-def leaky_relu(g, input, negative_slope, inplace):
+def leaky_relu(g, input, negative_slope, inplace=False):
     # See Note [Export inplace]
     # TODO: Talk to ONNX about unconditional cast of scalar to float
     return g.op("LeakyRelu", input, alpha_f=_scalar(negative_slope))
@@ -192,20 +240,21 @@ def softmax(g, input, dim=None):
 
 def max_pool2d(g, input, kernel_size, stride, padding, dilation, ceil_mode):
     if ceil_mode:
-        raise RuntimeError("ceil_mode not supported in MaxPool2d")
+        return _unimplemented("max_pool2d", "ceil_mode")
+    if set(_pair(dilation)) != {1}:
+        return _unimplemented("max_pool2d", "dilation")
     if not stride:
         stride = kernel_size
     r = g.op("MaxPool", input,
              kernel_shape_i=_pair(kernel_size),
              pads_i=_pair(padding),
-             dilations_i=_pair(dilation),
              strides_i=_pair(stride))
     return r, None
 
 
 def avg_pool2d(g, input, kernel_size, stride, padding, ceil_mode, count_include_pad):
     if ceil_mode:
-        raise RuntimeError("ceil_mode not supported in AvgPool2d")
+        return _unimplemented("avg_pool2d", "ceil_mode")
     if not stride:
         stride = kernel_size
     # TODO: What about count_include_pad?!
@@ -217,3 +266,17 @@ def avg_pool2d(g, input, kernel_size, stride, padding, ceil_mode, count_include_
 
 def log_softmax(g, input, dim=None):
     return g.op("Log", g.op('Softmax', input, axis_i=dim).setTypeAs(input))
+
+
+def unfold(g, input, dimension, size, step):
+    return g.op("ATen", input, operator_s="unfold", dimension_i=dimension, size_i=size, step_i=step)
+
+
+def elu(g, input, alpha, inplace=False):
+    # See Note [Export inplace]
+    return g.op("Elu", input, alpha_f=_scalar(alpha))
+
+
+# ignore clone operators that are inserted by PyTorch autograd
+def clone(g, input):
+    return input

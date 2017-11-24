@@ -85,7 +85,11 @@ struct CompiledFusionFunction {
   CompiledFusionFunction(const std::string & name, AnnotatedGraph & agraph);
   ~CompiledFusionFunction();
 
-  void launch(at::ArrayRef<at::Tensor> inputs, at::ArrayRef<at::Tensor> outputs);
+  // expects outputs to be pre-allocated
+  void launch_with_tensors(at::ArrayRef<at::Tensor> inputs, at::ArrayRef<at::Tensor> outputs);
+
+  // creates new tensors for outputs
+  void launch(at::ArrayRef<at::Tensor> inputs, std::vector<at::Tensor> & outputs);
   const std::vector<TensorDesc> & outputDescriptors() const {
     return output_desc;
   }
@@ -93,7 +97,7 @@ private:
   void launch(uint32_t numel, void ** arguments);
   std::string name;
   // We keep these around for debugging
-  std::string compliation_unit;
+  std::string compilation_unit;
   std::vector<char> ptx;
   CUmodule module;
   CUfunction function;
